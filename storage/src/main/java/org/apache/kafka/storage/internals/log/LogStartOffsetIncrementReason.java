@@ -21,7 +21,8 @@ public enum LogStartOffsetIncrementReason {
     LeaderOffsetIncremented("leader offset increment"),
     SegmentDeletion("segment deletion"),
     ClientRecordDeletion("client delete records request"),
-    SnapshotGenerated("snapshot generated");
+    SnapshotGenerated("snapshot generated"),
+    ConsumedRetention("consumed retention");
 
     private final String reason;
 

@@ -1428,6 +1428,46 @@ class PartitionTest extends AbstractPartitionTest {
   }
 
   @Test
+  def testAdvanceLogStartOffsetForConsumedRetention(): Unit = {
+    val leaderEpoch = 5
+    val replicas = Array(brokerId, brokerId + 1)
+
+    partition.createLogIfNotExists(isNew = false, isFutureReplica = false, offsetCheckpoints, None)
+    val partitionRegistration = new PartitionRegistration.Builder()
+      .setLeader(brokerId)
+      .setLeaderRecoveryState(LeaderRecoveryState.RECOVERED)
+      .setLeaderEpoch(leaderEpoch)
+      .setIsr(replicas)
+      .setPartitionEpoch(1)
+      .setReplicas(replicas)
+      .setDirectories(DirectoryId.unassignedArray(replicas.length))
+      .build()
+    assertTrue(partition.makeLeader(partitionRegistration, isNew = true, offsetCheckpoints, None))
+
+    val log = partition.log.get
+    seedLogData(log, numRecords = 10, leaderEpoch = leaderEpoch)
+    log.updateHighWatermark(6L)
+
+    // A floor above the high watermark is refused instead of raising OffsetOutOfRangeException.
+    assertFalse(partition.advanceLogStartOffsetForConsumedRetention(7L))
+    assertEquals(0L, log.logStartOffset)
+
+    assertTrue(partition.advanceLogStartOffsetForConsumedRetention(5L))
+    assertEquals(5L, log.logStartOffset)
+
+    // logStartOffset only ever moves forward, so a floor that does not exceed it is a no-op.
+    assertFalse(partition.advanceLogStartOffsetForConsumedRetention(5L))
+    assertFalse(partition.advanceLogStartOffsetForConsumedRetention(3L))
+    assertEquals(5L, log.logStartOffset)
+  }
+
+  @Test
+  def testAdvanceLogStartOffsetForConsumedRetentionIgnoresPartitionNotLedLocally(): Unit = {
+    partition.createLogIfNotExists(isNew = false, isFutureReplica = false, offsetCheckpoints, None)
+    assertFalse(partition.advanceLogStartOffsetForConsumedRetention(1L))
+  }
+
+  @Test
   def testIsReplicaIsrEligibleWithEmptyReplicaMap(): Unit = {
     val partition = spy(new Partition(topicPartition,
       replicaLagTimeMaxMs = ReplicationConfigs.REPLICA_LAG_TIME_MAX_MS_DEFAULT,

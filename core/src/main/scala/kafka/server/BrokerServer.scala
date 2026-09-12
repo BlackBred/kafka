@@ -174,6 +174,8 @@ class BrokerServer(
 
   var persister: Persister = _
 
+  private var consumedRetentionManager: ConsumedRetentionManager = _
+
   private var shareGroupTimer: Timer = _
 
   private var shareGroupDLQManager: ShareGroupDLQManager = _
@@ -489,6 +491,15 @@ class BrokerServer(
         () => ShareVersion.fromFeatureLevel(metadataCache.features.finalizedFeatures.getOrDefault(ShareVersion.FEATURE_NAME, 0.toShort)).supportsShareGroupDLQ(),
         shareGroupDLQManager
       )
+
+      /* create the component that advances logStartOffset past records the configured groups have consumed */
+      consumedRetentionManager = new ConsumedRetentionManager(
+        replicaManager,
+        persister,
+        kafkaScheduler,
+        config.logRetentionConsumedCheckIntervalMs
+      )
+      consumedRetentionManager.startup()
 
       dataPlaneRequestProcessor = new KafkaApis(
         requestChannel = socketServer.dataPlaneRequestChannel,
@@ -865,6 +876,10 @@ class BrokerServer(
       if (dataPlaneRequestProcessor != null)
         Utils.swallow(this.logger.underlying, () => dataPlaneRequestProcessor.close())
       authorizerPlugin.foreach(Utils.closeQuietly(_, "authorizer plugin"))
+
+      // Cancel the consumed retention check before the scheduler goes away, so that it stops touching logs and the
+      // persister while both are still alive.
+      Utils.closeQuietly(consumedRetentionManager, "consumed retention manager")
 
       /**
        * We must shutdown the scheduler early because otherwise, the scheduler could touch other

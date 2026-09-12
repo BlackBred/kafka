@@ -85,6 +85,13 @@ public class ServerLogConfigs {
     public static final long LOG_CLEANUP_INTERVAL_MS_DEFAULT = 5 * 60 * 1000L;
     public static final String LOG_CLEANUP_INTERVAL_MS_DOC = "The frequency in milliseconds that the log cleaner checks whether any log is eligible for deletion";
 
+    public static final String LOG_RETENTION_CONSUMED_CHECK_INTERVAL_MS_CONFIG = LOG_PREFIX + "retention.consumed.check.interval.ms";
+    public static final long LOG_RETENTION_CONSUMED_CHECK_INTERVAL_MS_DEFAULT = 30 * 1000L;
+    public static final String LOG_RETENTION_CONSUMED_CHECK_INTERVAL_MS_DOC = "The frequency in milliseconds that the broker checks the consumption " +
+            "progress of the groups listed in <code>" + TopicConfig.RETENTION_CONSUMED_GROUPS_CONFIG + "</code> in order to advance " +
+            "<code>logStartOffset</code>. Only topics that set that configuration are checked. A shorter interval keeps less consumed data on disk " +
+            "at the cost of more frequent requests to the group state, and the interval bounds how much consumed data can accumulate locally.";
+
     public static final String LOG_CLEANUP_POLICY_CONFIG = ServerTopicConfigSynonyms.serverSynonym(TopicConfig.CLEANUP_POLICY_CONFIG);
     public static final String LOG_CLEANUP_POLICY_DEFAULT = TopicConfig.CLEANUP_POLICY_DELETE;
     public static final String LOG_CLEANUP_POLICY_DOC = TopicConfig.CLEANUP_POLICY_DOC;

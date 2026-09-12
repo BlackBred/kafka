@@ -2115,7 +2115,9 @@ class ReplicaManager(val config: KafkaConfig,
     }
   }
 
-  private def leaderPartitionsIterator: Iterator[Partition] =
+  // An iterator over all partitions led by this broker. Weakly consistent in the same way as onlinePartitionsIterator:
+  // a partition whose leadership changes after the iterator has been constructed could still be returned.
+  def leaderPartitionsIterator: Iterator[Partition] =
     onlinePartitionsIterator.filter(_.leaderLogIfLocal.isDefined)
 
   def getLogEndOffset(topicPartition: TopicPartition): Option[Long] =

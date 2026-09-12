@@ -137,6 +137,8 @@ public class LogConfig extends AbstractConfig {
     public static final boolean DEFAULT_UNCLEAN_LEADER_ELECTION_ENABLE = false;
     public static final boolean DEFAULT_PREALLOCATE = false;
     public static final boolean DEFAULT_ERRORS_DEADLETTERQUEUE_GROUP_ENABLE = false;
+    public static final List<String> DEFAULT_RETENTION_CONSUMED_GROUPS = List.of();
+    public static final long DEFAULT_RETENTION_CONSUMED_LAG_MESSAGES = 0;
 
     public static final boolean DEFAULT_REMOTE_STORAGE_ENABLE = false;
     public static final boolean DEFAULT_REMOTE_LOG_COPY_DISABLE = false;
@@ -166,6 +168,7 @@ public class LogConfig extends AbstractConfig {
 
             .define(ServerLogConfigs.LOG_RETENTION_BYTES_CONFIG, LONG, ServerLogConfigs.LOG_RETENTION_BYTES_DEFAULT, HIGH, ServerLogConfigs.LOG_RETENTION_BYTES_DOC)
             .define(ServerLogConfigs.LOG_CLEANUP_INTERVAL_MS_CONFIG, LONG, ServerLogConfigs.LOG_CLEANUP_INTERVAL_MS_DEFAULT, atLeast(1), MEDIUM, ServerLogConfigs.LOG_CLEANUP_INTERVAL_MS_DOC)
+            .define(ServerLogConfigs.LOG_RETENTION_CONSUMED_CHECK_INTERVAL_MS_CONFIG, LONG, ServerLogConfigs.LOG_RETENTION_CONSUMED_CHECK_INTERVAL_MS_DEFAULT, atLeast(1), MEDIUM, ServerLogConfigs.LOG_RETENTION_CONSUMED_CHECK_INTERVAL_MS_DOC)
             .define(ServerLogConfigs.LOG_CLEANUP_POLICY_CONFIG, LIST, ServerLogConfigs.LOG_CLEANUP_POLICY_DEFAULT, ConfigDef.ValidList.in(TopicConfig.CLEANUP_POLICY_COMPACT, TopicConfig.CLEANUP_POLICY_DELETE), MEDIUM, ServerLogConfigs.LOG_CLEANUP_POLICY_DOC)
             .define(ServerLogConfigs.LOG_INDEX_SIZE_MAX_BYTES_CONFIG, INT, ServerLogConfigs.LOG_INDEX_SIZE_MAX_BYTES_DEFAULT, atLeast(4), MEDIUM, ServerLogConfigs.LOG_INDEX_SIZE_MAX_BYTES_DOC)
             .define(ServerLogConfigs.LOG_INDEX_INTERVAL_BYTES_CONFIG, INT, ServerLogConfigs.LOG_INDEX_INTERVAL_BYTES_DEFAULT, atLeast(0), MEDIUM, ServerLogConfigs.LOG_INDEX_INTERVAL_BYTES_DOC)
@@ -206,6 +209,10 @@ public class LogConfig extends AbstractConfig {
                 // can be negative. See kafka.log.LogManager.cleanupExpiredSegments
                 .define(TopicConfig.RETENTION_MS_CONFIG, LONG, DEFAULT_RETENTION_MS, atLeast(-1), MEDIUM,
                         TopicConfig.RETENTION_MS_DOC)
+                .define(TopicConfig.RETENTION_CONSUMED_GROUPS_CONFIG, LIST, DEFAULT_RETENTION_CONSUMED_GROUPS,
+                        ValidList.anyNonDuplicateValues(true, false), MEDIUM, TopicConfig.RETENTION_CONSUMED_GROUPS_DOC)
+                .define(TopicConfig.RETENTION_CONSUMED_LAG_MESSAGES_CONFIG, LONG, DEFAULT_RETENTION_CONSUMED_LAG_MESSAGES, atLeast(0), MEDIUM,
+                        TopicConfig.RETENTION_CONSUMED_LAG_MESSAGES_DOC)
                 .define(TopicConfig.MAX_MESSAGE_BYTES_CONFIG, INT, ServerLogConfigs.MAX_MESSAGE_BYTES_DEFAULT, atLeast(0), MEDIUM,
                         TopicConfig.MAX_MESSAGE_BYTES_DOC)
                 .define(TopicConfig.INDEX_INTERVAL_BYTES_CONFIG, INT, ServerLogConfigs.LOG_INDEX_INTERVAL_BYTES_DEFAULT, atLeast(0), MEDIUM,
@@ -274,6 +281,8 @@ public class LogConfig extends AbstractConfig {
     public final long flushMs;
     public final long retentionSize;
     public final long retentionMs;
+    public final List<String> retentionConsumedGroups;
+    public final long retentionConsumedLagMessages;
     public final int indexInterval;
     public final long fileDeleteDelayMs;
     public final long deleteRetentionMs;
@@ -319,6 +328,8 @@ public class LogConfig extends AbstractConfig {
         this.flushMs = getLong(TopicConfig.FLUSH_MS_CONFIG);
         this.retentionSize = getLong(TopicConfig.RETENTION_BYTES_CONFIG);
         this.retentionMs = getLong(TopicConfig.RETENTION_MS_CONFIG);
+        this.retentionConsumedGroups = Collections.unmodifiableList(getList(TopicConfig.RETENTION_CONSUMED_GROUPS_CONFIG));
+        this.retentionConsumedLagMessages = getLong(TopicConfig.RETENTION_CONSUMED_LAG_MESSAGES_CONFIG);
         this.maxMessageSize = getInt(TopicConfig.MAX_MESSAGE_BYTES_CONFIG);
         this.indexInterval = getInt(TopicConfig.INDEX_INTERVAL_BYTES_CONFIG);
         this.fileDeleteDelayMs = getLong(TopicConfig.FILE_DELETE_DELAY_MS_CONFIG);
@@ -399,6 +410,10 @@ public class LogConfig extends AbstractConfig {
 
     public boolean errorsDeadletterqueueGroupEnable() {
         return errorsDeadletterqueueGroupEnable;
+    }
+
+    public boolean consumedRetentionEnabled() {
+        return !retentionConsumedGroups.isEmpty();
     }
 
     public boolean remoteStorageEnable() {
@@ -497,6 +512,30 @@ public class LogConfig extends AbstractConfig {
             throw new InvalidConfigurationException("conflict topic config setting "
                     + TopicConfig.MIN_COMPACTION_LAG_MS_CONFIG + " (" + minCompactionLag + ") > "
                     + TopicConfig.MAX_COMPACTION_LAG_MS_CONFIG + " (" + maxCompactionLag + ")");
+        }
+        validateConsumedRetentionRequiresDeleteCleanupPolicy(props);
+    }
+
+    /**
+     * Consumption-driven retention advances {@code logStartOffset} past records that have been consumed. On a topic that is
+     * only compacted this would discard the tail of the key space rather than obsolete record versions, so the delete
+     * cleanup policy is required.
+     */
+    @SuppressWarnings("unchecked")
+    private static void validateConsumedRetentionRequiresDeleteCleanupPolicy(Map<String, ?> props) {
+        List<String> consumedGroups = (List<String>) props.get(TopicConfig.RETENTION_CONSUMED_GROUPS_CONFIG);
+        List<String> cleanupPolicy = (List<String>) props.get(TopicConfig.CLEANUP_POLICY_CONFIG);
+        // Broker-level configs have no synonym for the consumed retention settings, so they are absent on that path.
+        if (consumedGroups == null || consumedGroups.isEmpty() || cleanupPolicy == null) {
+            return;
+        }
+        boolean deletePolicy = cleanupPolicy.stream()
+                .map(policy -> policy.toLowerCase(Locale.ROOT))
+                .anyMatch(TopicConfig.CLEANUP_POLICY_DELETE::equals);
+        if (!deletePolicy) {
+            throw new InvalidConfigurationException("conflict topic config setting "
+                    + TopicConfig.RETENTION_CONSUMED_GROUPS_CONFIG + " requires "
+                    + TopicConfig.CLEANUP_POLICY_CONFIG + " to contain " + TopicConfig.CLEANUP_POLICY_DELETE);
         }
     }
 
@@ -685,6 +724,8 @@ public class LogConfig extends AbstractConfig {
                 ", flushMs=" + flushMs +
                 ", retentionSize=" + retentionSize +
                 ", retentionMs=" + retentionMs +
+                ", retentionConsumedGroups=" + retentionConsumedGroups +
+                ", retentionConsumedLagMessages=" + retentionConsumedLagMessages +
                 ", indexInterval=" + indexInterval +
                 ", fileDeleteDelayMs=" + fileDeleteDelayMs +
                 ", deleteRetentionMs=" + deleteRetentionMs +

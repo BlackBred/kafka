@@ -1541,6 +1541,24 @@ class Partition(val topicPartition: TopicPartition,
   })
 
   /**
+   * Advance logStartOffset to a position that the groups configured in `retention.consumed.groups` have consumed past,
+   * so that consumed segments are deleted rather than retained until the size or time retention limit is breached.
+   *
+   * Unlike `deleteRecordsOnLeader` this is an internal decision rather than a client request, so a partition that is no
+   * longer led locally, an offset that does not move logStartOffset forward, or an offset above the high watermark is
+   * silently ignored instead of raising an error.
+   *
+   * Return true if logStartOffset was advanced.
+   */
+  def advanceLogStartOffsetForConsumedRetention(offset: Long): Boolean = inReadLock(leaderIsrUpdateLock, () => {
+    leaderLogIfLocal.exists { leaderLog =>
+      offset > leaderLog.logStartOffset &&
+        offset <= leaderLog.highWatermark &&
+        leaderLog.maybeIncrementLogStartOffset(offset, LogStartOffsetIncrementReason.ConsumedRetention)
+    }
+  })
+
+  /**
     * Truncate the local log of this partition to the specified offset and checkpoint the recovery point to this offset
     *
     * @param offset offset to be used for truncation

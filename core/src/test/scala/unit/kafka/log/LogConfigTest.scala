@@ -76,6 +76,8 @@ class LogConfigTest {
       case TopicConfig.REMOTE_COPY_LAG_MS_CONFIG => assertPropertyInvalid(name, "not_a_number", "-2")
       case TopicConfig.REMOTE_COPY_LAG_BYTES_CONFIG => assertPropertyInvalid(name, "not_a_number", "-2")
       case TopicConfig.ERRORS_DEADLETTERQUEUE_GROUP_ENABLE_CONFIG => assertPropertyInvalid(name, "not_a_boolean")
+      // Duplicates in a list config are deduplicated rather than rejected, so only a blank group id is invalid.
+      case TopicConfig.RETENTION_CONSUMED_GROUPS_CONFIG => assertPropertyInvalid(name, "group,,other-group")
       case LogConfig.INTERNAL_SEGMENT_BYTES_CONFIG => // no op
 
       case _ => assertPropertyInvalid(name, "not_a_number", "-1")
@@ -489,5 +491,35 @@ class LogConfigTest {
     val logProps = new util.HashMap[String, String]
     logProps.put(TopicConfig.REMOTE_LOG_DELETE_ON_DISABLE_CONFIG, deleteOnDisable.toString)
     LogConfig.validate(logProps)
+  }
+
+  @Test
+  def testConsumedRetentionRequiresDeleteCleanupPolicy(): Unit = {
+    val logProps = new util.HashMap[String, String]
+    logProps.put(TopicConfig.RETENTION_CONSUMED_GROUPS_CONFIG, "share-group")
+    LogConfig.validate(logProps)
+
+    logProps.put(TopicConfig.CLEANUP_POLICY_CONFIG, TopicConfig.CLEANUP_POLICY_DELETE)
+    LogConfig.validate(logProps)
+
+    logProps.put(TopicConfig.CLEANUP_POLICY_CONFIG,
+      s"${TopicConfig.CLEANUP_POLICY_COMPACT},${TopicConfig.CLEANUP_POLICY_DELETE}")
+    LogConfig.validate(logProps)
+
+    logProps.put(TopicConfig.CLEANUP_POLICY_CONFIG, TopicConfig.CLEANUP_POLICY_COMPACT)
+    val message = assertThrows(classOf[InvalidConfigurationException], () => LogConfig.validate(logProps)).getMessage
+    assertTrue(message.contains(TopicConfig.RETENTION_CONSUMED_GROUPS_CONFIG), message)
+
+    // Without any configured group the cleanup policy is unconstrained.
+    logProps.remove(TopicConfig.RETENTION_CONSUMED_GROUPS_CONFIG)
+    LogConfig.validate(logProps)
+  }
+
+  @Test
+  def testConsumedRetentionDefaultsAreDisabled(): Unit = {
+    val logConfig = new LogConfig(new util.HashMap[String, String])
+    assertEquals(util.List.of, logConfig.retentionConsumedGroups)
+    assertEquals(0L, logConfig.retentionConsumedLagMessages)
+    assertFalse(logConfig.consumedRetentionEnabled())
   }
 }

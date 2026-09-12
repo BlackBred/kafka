@@ -88,6 +88,23 @@ public class TopicConfig {
         "operates independently of \"segment.ms\" and \"segment.bytes\" configurations. " +
         "Moreover, it triggers the rolling of new segment if the retention.ms condition is satisfied.";
 
+    public static final String RETENTION_CONSUMED_GROUPS_CONFIG = "retention.consumed.groups";
+    public static final String RETENTION_CONSUMED_GROUPS_DOC = "A list of group ids whose consumption progress drives retention for this topic. " +
+        "When this list is non-empty, the broker periodically advances <code>logStartOffset</code> of each partition to the lowest position that all " +
+        "listed groups have consumed past, so records are deleted once they have been consumed instead of being retained until " +
+        "<code>retention.ms</code> or <code>retention.bytes</code> is breached. Combined with tiered storage this keeps consumed records from being " +
+        "uploaded to remote storage at all, because segments below <code>logStartOffset</code> are never copied. " +
+        "Only share groups are supported; ids of other group types are ignored. " +
+        "A group that has no consumption progress recorded yet does not advance the offset, so records are never deleted before they are consumed. " +
+        "Default is an empty list, which disables consumption-driven retention. " +
+        "This configuration requires <code>cleanup.policy=delete</code>.";
+
+    public static final String RETENTION_CONSUMED_LAG_MESSAGES_CONFIG = "retention.consumed.lag.messages";
+    public static final String RETENTION_CONSUMED_LAG_MESSAGES_DOC = "The number of consumed records to retain below the consumption position " +
+        "of the groups listed in <code>retention.consumed.groups</code>. Consumption-driven retention keeps <code>logStartOffset</code> this many " +
+        "offsets behind the lowest consumed position, which leaves a replay window after records have been consumed. " +
+        "This setting has no effect when <code>retention.consumed.groups</code> is empty.";
+
     public static final String REMOTE_LOG_STORAGE_ENABLE_CONFIG = "remote.storage.enable";
     public static final String REMOTE_LOG_STORAGE_ENABLE_DOC = "To enable tiered storage for a topic, set this configuration to true. " +
             "To disable tiered storage for a topic that has it enabled, set this configuration to false. " +

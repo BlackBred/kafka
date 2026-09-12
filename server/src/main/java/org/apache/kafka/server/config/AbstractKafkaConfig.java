@@ -540,6 +540,10 @@ public abstract class AbstractKafkaConfig extends AbstractConfig {
         return getLong(ServerLogConfigs.LOG_CLEANUP_INTERVAL_MS_CONFIG);
     }
 
+    public long logRetentionConsumedCheckIntervalMs() {
+        return getLong(ServerLogConfigs.LOG_RETENTION_CONSUMED_CHECK_INTERVAL_MS_CONFIG);
+    }
+
     public List<String> logCleanupPolicy() {
         return getList(ServerLogConfigs.LOG_CLEANUP_POLICY_CONFIG);
     }
