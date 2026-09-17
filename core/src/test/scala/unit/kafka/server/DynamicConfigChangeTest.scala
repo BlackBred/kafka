@@ -637,4 +637,35 @@ class DynamicConfigChangeUnitTest {
     configHandler.maybeUpdateRemoteLogComponents(topic, Seq(log0), isRemoteLogEnabledBeforeUpdate, false)
     verify(rlm, never()).onLeadershipChange(any(), any(), any())
   }
+
+  @Test
+  def testEnableConsumedRetentionOnTopic(): Unit = {
+    val topic = "test-topic"
+    val crm: ConsumedRetentionManager = mock(classOf[ConsumedRetentionManager])
+    val replicaManager: ReplicaManager = mock(classOf[ReplicaManager])
+    when(replicaManager.consumedRetentionManager).thenReturn(Some(crm))
+
+    val tp0 = new TopicPartition(topic, 0)
+    val log0: UnifiedLog = mock(classOf[UnifiedLog])
+    val partition0: Partition = mock(classOf[Partition])
+    when(log0.topicPartition).thenReturn(tp0)
+    when(partition0.isLeader).thenReturn(true)
+    when(replicaManager.onlinePartition(tp0)).thenReturn(Some(partition0))
+
+    val tp1 = new TopicPartition(topic, 1)
+    val log1: UnifiedLog = mock(classOf[UnifiedLog])
+    val partition1: Partition = mock(classOf[Partition])
+    when(log1.topicPartition).thenReturn(tp1)
+    when(partition1.isLeader).thenReturn(false)
+    when(replicaManager.onlinePartition(tp1)).thenReturn(Some(partition1))
+
+    val leaderPartitionsArg: ArgumentCaptor[util.Set[Partition]] = ArgumentCaptor.forClass(classOf[util.Set[Partition]])
+    val followerPartitionsArg: ArgumentCaptor[util.Set[Partition]] = ArgumentCaptor.forClass(classOf[util.Set[Partition]])
+    doNothing().when(crm).onLeadershipChange(leaderPartitionsArg.capture(), followerPartitionsArg.capture())
+
+    val configHandler: TopicConfigHandler = new TopicConfigHandler(replicaManager, null, null)
+    configHandler.updateConsumedRetentionComponents(Seq(log0, log1))
+    assertEquals(Collections.singleton(partition0), leaderPartitionsArg.getValue)
+    assertEquals(Collections.singleton(partition1), followerPartitionsArg.getValue)
+  }
 }

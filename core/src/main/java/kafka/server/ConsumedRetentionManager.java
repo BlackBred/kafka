@@ -19,6 +19,7 @@ package kafka.server;
 import kafka.cluster.Partition;
 
 import org.apache.kafka.common.TopicIdPartition;
+import org.apache.kafka.common.TopicPartition;
 import org.apache.kafka.common.Uuid;
 import org.apache.kafka.common.message.ReadShareGroupStateSummaryRequestData;
 import org.apache.kafka.common.protocol.Errors;
@@ -41,7 +42,6 @@ import org.slf4j.LoggerFactory;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.HashSet;
-import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -52,8 +52,8 @@ import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.function.Function;
 
-import scala.jdk.javaapi.CollectionConverters;
 import scala.jdk.javaapi.OptionConverters;
 
 /**
@@ -84,10 +84,18 @@ public class ConsumedRetentionManager implements AutoCloseable {
     static final String SKIPPED_PARTITION_COUNT_METRIC = "SkippedPartitionCount";
     static final String CHECK_FAILURES_METRIC = "CheckFailuresPerSec";
 
-    private final ReplicaManager replicaManager;
+    private final Function<TopicPartition, Optional<Partition>> partitionLookup;
     private final Persister persister;
     private final Scheduler scheduler;
     private final long checkIntervalMs;
+
+    /**
+     * The partitions led by this broker that have consumption-driven retention configured. Only the identity is kept:
+     * the {@link Partition}, its topic id and its configuration are all resolved again on every check, so that a
+     * reassigned partition is not held on to and so that changes to the configured groups and lag are picked up without
+     * a notification.
+     */
+    private final Set<TopicPartition> enabledPartitions = ConcurrentHashMap.newKeySet();
 
     private final KafkaMetricsGroup metricsGroup = new KafkaMetricsGroup(METRICS_PACKAGE, METRICS_TYPE);
     private final AtomicInteger enabledPartitionCount = new AtomicInteger();
@@ -98,11 +106,11 @@ public class ConsumedRetentionManager implements AutoCloseable {
     private final AtomicBoolean checkInFlight = new AtomicBoolean();
     private volatile ScheduledFuture<?> scheduledCheck;
 
-    public ConsumedRetentionManager(ReplicaManager replicaManager,
+    public ConsumedRetentionManager(Function<TopicPartition, Optional<Partition>> partitionLookup,
                                     Persister persister,
                                     Scheduler scheduler,
                                     long checkIntervalMs) {
-        this.replicaManager = replicaManager;
+        this.partitionLookup = partitionLookup;
         this.persister = persister;
         this.scheduler = scheduler;
         this.checkIntervalMs = checkIntervalMs;
@@ -126,6 +134,49 @@ public class ConsumedRetentionManager implements AutoCloseable {
         metricsGroup.removeMetric(CHECK_FAILURES_METRIC);
     }
 
+    /**
+     * Registers the partitions this broker became the leader of that have consumption-driven retention configured, and
+     * unregisters the ones it became a follower of. A new leader whose configuration does not enable the feature is
+     * unregistered rather than ignored, so that the topic configuration change hook can call this method
+     * unconditionally and have it handle both enabling and disabling the feature.
+     */
+    public void onLeadershipChange(Set<Partition> partitionsBecomeLeader, Set<Partition> partitionsBecomeFollower) {
+        if (partitionsBecomeLeader.isEmpty() && partitionsBecomeFollower.isEmpty()) {
+            return;
+        }
+        List<TopicPartition> registered = new ArrayList<>();
+        List<TopicPartition> unregistered = new ArrayList<>();
+        for (Partition partition : partitionsBecomeFollower) {
+            if (enabledPartitions.remove(partition.topicPartition())) {
+                unregistered.add(partition.topicPartition());
+            }
+        }
+        for (Partition partition : partitionsBecomeLeader) {
+            TopicPartition topicPartition = partition.topicPartition();
+            boolean enabled = OptionConverters.toJava(partition.leaderLogIfLocal())
+                .map(log -> log.config().consumedRetentionEnabled())
+                .orElse(false);
+            if (enabled) {
+                if (enabledPartitions.add(topicPartition)) {
+                    registered.add(topicPartition);
+                }
+            } else if (enabledPartitions.remove(topicPartition)) {
+                unregistered.add(topicPartition);
+            }
+        }
+        if (!registered.isEmpty() || !unregistered.isEmpty()) {
+            LOG.debug("Registered {} and unregistered {} for consumption-driven retention, {} partitions are registered now",
+                registered, unregistered, enabledPartitions.size());
+        }
+    }
+
+    /**
+     * Unregisters partitions that this broker no longer hosts, such as deleted or reassigned ones.
+     */
+    public void stopPartitions(Set<TopicPartition> partitions) {
+        partitions.forEach(enabledPartitions::remove);
+    }
+
     // Visible for testing
     void maybeAdvanceLogStartOffsets() {
         if (!checkInFlight.compareAndSet(false, true)) {
@@ -134,13 +185,14 @@ public class ConsumedRetentionManager implements AutoCloseable {
         }
         boolean checkFinished = true;
         try {
-            Map<TopicIdPartition, ConsumedRetentionTarget> targets = collectTargets();
-            enabledPartitionCount.set(targets.size());
+            CollectedTargets collected = collectTargets();
+            Map<TopicIdPartition, ConsumedRetentionTarget> targets = collected.targets();
+            enabledPartitionCount.set(targets.size() + collected.withoutTopicId());
             if (targets.isEmpty()) {
-                skippedPartitionCount.set(0);
+                skippedPartitionCount.set(collected.withoutTopicId());
                 return;
             }
-            CompletableFuture<Void> check = readConsumedPositions(targets);
+            CompletableFuture<Void> check = readConsumedPositions(targets, collected.withoutTopicId());
             check.whenComplete((ignored, error) -> {
                 if (error != null) {
                     checkFailures.mark();
@@ -160,38 +212,44 @@ public class ConsumedRetentionManager implements AutoCloseable {
     }
 
     /**
-     * The partitions led by this broker that have consumption-driven retention configured. A partition whose topic id is
-     * not known yet is left out, because the share group state is keyed by topic id.
+     * The registered partitions that this broker still leads with consumption-driven retention configured. A partition
+     * that no longer qualifies is unregistered here, so that a registration which was not followed by a leadership or
+     * configuration change notification does not linger.
      */
-    private Map<TopicIdPartition, ConsumedRetentionTarget> collectTargets() {
+    private CollectedTargets collectTargets() {
         Map<TopicIdPartition, ConsumedRetentionTarget> targets = new HashMap<>();
-        Iterator<Partition> partitions = CollectionConverters.asJava(replicaManager.leaderPartitionsIterator());
-        while (partitions.hasNext()) {
-            Partition partition = partitions.next();
-            Optional<UnifiedLog> log = OptionConverters.toJava(partition.leaderLogIfLocal());
-            if (log.isEmpty()) {
+        int withoutTopicId = 0;
+        for (TopicPartition topicPartition : enabledPartitions) {
+            Optional<Partition> partition = partitionLookup.apply(topicPartition);
+            Optional<LogConfig> config = partition
+                .flatMap(p -> OptionConverters.toJava(p.leaderLogIfLocal()))
+                .map(UnifiedLog::config);
+            if (config.isEmpty() || !config.get().consumedRetentionEnabled()) {
+                LOG.debug("Unregistering {} because it is no longer a leader partition with consumed retention configured",
+                    topicPartition);
+                enabledPartitions.remove(topicPartition);
                 continue;
             }
-            LogConfig config = log.get().config();
-            if (!config.consumedRetentionEnabled()) {
-                continue;
-            }
-            Optional<Uuid> topicId = OptionConverters.toJava(partition.topicId());
+            Optional<Uuid> topicId = OptionConverters.toJava(partition.get().topicId());
             if (topicId.isEmpty()) {
-                LOG.debug("Skipping consumed retention for {} because its topic id is not known yet", partition.topicPartition());
+                // The share group state is keyed by topic id, so the partition has to stay registered and wait for a
+                // later check rather than be unregistered.
+                LOG.debug("Skipping consumed retention for {} because its topic id is not known yet", topicPartition);
+                withoutTopicId++;
                 continue;
             }
-            targets.put(new TopicIdPartition(topicId.get(), partition.topicPartition()),
-                new ConsumedRetentionTarget(partition, config.retentionConsumedGroups, config.retentionConsumedLagMessages));
+            targets.put(new TopicIdPartition(topicId.get(), topicPartition),
+                new ConsumedRetentionTarget(partition.get(), config.get().retentionConsumedGroups, config.get().retentionConsumedLagMessages));
         }
-        return targets;
+        return new CollectedTargets(targets, withoutTopicId);
     }
 
     /**
      * Reads the consumed position of every configured group and applies the resulting floor. One request is issued per
      * group, covering all partitions that list that group.
      */
-    private CompletableFuture<Void> readConsumedPositions(Map<TopicIdPartition, ConsumedRetentionTarget> targets) {
+    private CompletableFuture<Void> readConsumedPositions(Map<TopicIdPartition, ConsumedRetentionTarget> targets,
+                                                          int withoutTopicId) {
         Map<String, List<TopicIdPartition>> partitionsByGroup = new HashMap<>();
         targets.forEach((topicIdPartition, target) -> target.groups().forEach(group ->
             partitionsByGroup.computeIfAbsent(group, ignored -> new ArrayList<>()).add(topicIdPartition)));
@@ -207,7 +265,7 @@ public class ConsumedRetentionManager implements AutoCloseable {
             reads.add(readGroup(group, groupPartitions, consumedPositions, withoutPosition)));
 
         return CompletableFuture.allOf(reads.toArray(new CompletableFuture<?>[0]))
-            .thenRun(() -> advance(targets, consumedPositions, withoutPosition));
+            .thenRun(() -> advance(targets, consumedPositions, withoutPosition, withoutTopicId));
     }
 
     private CompletableFuture<Void> readGroup(String group,
@@ -286,8 +344,9 @@ public class ConsumedRetentionManager implements AutoCloseable {
 
     private void advance(Map<TopicIdPartition, ConsumedRetentionTarget> targets,
                          Map<TopicIdPartition, Long> consumedPositions,
-                         Set<TopicIdPartition> withoutPosition) {
-        int skipped = 0;
+                         Set<TopicIdPartition> withoutPosition,
+                         int withoutTopicId) {
+        int skipped = withoutTopicId;
         for (Map.Entry<TopicIdPartition, ConsumedRetentionTarget> entry : targets.entrySet()) {
             TopicIdPartition topicIdPartition = entry.getKey();
             ConsumedRetentionTarget target = entry.getValue();
@@ -317,5 +376,12 @@ public class ConsumedRetentionManager implements AutoCloseable {
     }
 
     private record ConsumedRetentionTarget(Partition partition, List<String> groups, long lagMessages) {
+    }
+
+    /**
+     * What one pass over the registered partitions found: the partitions a request can be issued for, and how many are
+     * still waiting for their topic id and are therefore left to ordinary retention by this check.
+     */
+    private record CollectedTargets(Map<TopicIdPartition, ConsumedRetentionTarget> targets, int withoutTopicId) {
     }
 }

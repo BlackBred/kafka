@@ -58,6 +58,17 @@ class TopicConfigHandler(private val replicaManager: ReplicaManager,
     logManager.updateTopicConfig(topic, topicConfig, kafkaConfig.remoteLogManagerConfig.isRemoteStorageSystemEnabled,
       wasRemoteLogEnabled)
     maybeUpdateRemoteLogComponents(topic, logs, wasRemoteLogEnabled, wasCopyDisabled)
+    updateConsumedRetentionComponents(logs)
+  }
+
+  private[server] def updateConsumedRetentionComponents(logs: Seq[UnifiedLog]): Unit = {
+    val (leaderPartitions, followerPartitions) =
+      logs.flatMap(log => replicaManager.onlinePartition(log.topicPartition)).partition(_.isLeader)
+
+    // No "was enabled / is enabled" check is needed here, unlike for remote log storage: the component registers or
+    // unregisters each partition according to the configuration it reads, so a redundant notification is a no-op.
+    replicaManager.consumedRetentionManager.foreach(crm =>
+      crm.onLeadershipChange(leaderPartitions.toSet.asJava, followerPartitions.toSet.asJava))
   }
 
   private[server] def maybeUpdateRemoteLogComponents(topic: String,

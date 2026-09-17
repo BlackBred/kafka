@@ -36,14 +36,15 @@ import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Properties;
+import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.atomic.AtomicLong;
 
-import scala.jdk.javaapi.CollectionConverters;
 import scala.jdk.javaapi.OptionConverters;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -62,6 +63,9 @@ public class ConsumedRetentionManagerTest {
     private static final String OTHER_GROUP = "other-share-group";
     private static final Uuid TOPIC_ID = Uuid.randomUuid();
     private static final TopicPartition TOPIC_PARTITION = new TopicPartition("consumed-retention-topic", 0);
+
+    /** Stands in for the broker's partition lookup: tests add, replace or remove entries to model what it hosts. */
+    private final Map<TopicPartition, Partition> hostedPartitions = new HashMap<>();
 
     private ConsumedRetentionManager manager;
 
@@ -152,14 +156,20 @@ public class ConsumedRetentionManagerTest {
     }
 
     @Test
-    public void testIgnoresPartitionWhoseTopicIdIsNotKnownYet() {
+    public void testKeepsPartitionRegisteredUntilItsTopicIdIsKnown() {
         Partition partition = partition(consumedRetentionConfig(0L, GROUP));
         when(partition.topicId()).thenReturn(OptionConverters.toScala(Optional.<Uuid>empty()));
-        Persister persister = mock(Persister.class);
+        Persister persister = persisterReturning(Map.of(GROUP, summary(100L)));
 
-        newManager(persister, partition).maybeAdvanceLogStartOffsets();
-
+        ConsumedRetentionManager consumedRetentionManager = newManager(persister, partition);
+        consumedRetentionManager.maybeAdvanceLogStartOffsets();
         verify(persister, never()).readSummary(any());
+
+        // The partition stays registered, so the check picks it up as soon as the topic id is known.
+        when(partition.topicId()).thenReturn(OptionConverters.toScala(Optional.of(TOPIC_ID)));
+        consumedRetentionManager.maybeAdvanceLogStartOffsets();
+
+        verify(partition).advanceLogStartOffsetForConsumedRetention(100L);
     }
 
     @Test
@@ -191,6 +201,95 @@ public class ConsumedRetentionManagerTest {
         consumedRetentionManager.maybeAdvanceLogStartOffsets();
 
         verify(persister, times(2)).readSummary(any());
+    }
+
+    @Test
+    public void testIssuesNoRequestWhenNoPartitionIsRegistered() {
+        Persister persister = mock(Persister.class);
+
+        newManager(persister).maybeAdvanceLogStartOffsets();
+
+        verify(persister, never()).readSummary(any());
+    }
+
+    @Test
+    public void testStopsCheckingAPartitionThatBecameFollower() {
+        Partition partition = partition(consumedRetentionConfig(0L, GROUP));
+        Persister persister = persisterReturning(Map.of(GROUP, summary(100L)));
+
+        ConsumedRetentionManager consumedRetentionManager = newManager(persister, partition);
+        consumedRetentionManager.onLeadershipChange(Set.of(), Set.of(partition));
+        consumedRetentionManager.maybeAdvanceLogStartOffsets();
+
+        verify(persister, never()).readSummary(any());
+        verify(partition, never()).advanceLogStartOffsetForConsumedRetention(anyLong());
+    }
+
+    @Test
+    public void testDropsPartitionReconfiguredWithoutConsumedRetention() {
+        Partition partition = partition(consumedRetentionConfig(0L, GROUP));
+        Persister persister = persisterReturning(Map.of(GROUP, summary(100L)));
+
+        ConsumedRetentionManager consumedRetentionManager = newManager(persister, partition);
+        consumedRetentionManager.maybeAdvanceLogStartOffsets();
+        verify(persister, times(1)).readSummary(any());
+
+        reconfigure(partition, new LogConfig(new Properties()));
+        consumedRetentionManager.maybeAdvanceLogStartOffsets();
+
+        verify(persister, times(1)).readSummary(any());
+    }
+
+    @Test
+    public void testStopPartitionsUnregistersThePartition() {
+        Partition partition = partition(consumedRetentionConfig(0L, GROUP));
+        Persister persister = persisterReturning(Map.of(GROUP, summary(100L)));
+
+        ConsumedRetentionManager consumedRetentionManager = newManager(persister, partition);
+        consumedRetentionManager.stopPartitions(Set.of(TOPIC_PARTITION));
+        consumedRetentionManager.maybeAdvanceLogStartOffsets();
+
+        verify(persister, never()).readSummary(any());
+    }
+
+    @Test
+    public void testDropsPartitionThatIsNoLongerHosted() {
+        Partition partition = partition(consumedRetentionConfig(0L, GROUP));
+        Persister persister = persisterReturning(Map.of(GROUP, summary(100L)));
+
+        ConsumedRetentionManager consumedRetentionManager = newManager(persister, partition);
+        hostedPartitions.remove(TOPIC_PARTITION);
+        consumedRetentionManager.maybeAdvanceLogStartOffsets();
+
+        verify(persister, never()).readSummary(any());
+    }
+
+    @Test
+    public void testDropsPartitionThatIsNoLongerLeader() {
+        Partition partition = partition(consumedRetentionConfig(0L, GROUP));
+        Persister persister = persisterReturning(Map.of(GROUP, summary(100L)));
+
+        ConsumedRetentionManager consumedRetentionManager = newManager(persister, partition);
+        when(partition.leaderLogIfLocal()).thenReturn(OptionConverters.toScala(Optional.<UnifiedLog>empty()));
+        consumedRetentionManager.maybeAdvanceLogStartOffsets();
+
+        verify(persister, never()).readSummary(any());
+        verify(partition, never()).advanceLogStartOffsetForConsumedRetention(anyLong());
+    }
+
+    @Test
+    public void testPicksUpChangedGroupsAndLagWithoutANotification() {
+        Partition partition = partition(consumedRetentionConfig(10L, GROUP));
+        Persister persister = persisterReturning(Map.of(GROUP, summary(100L), OTHER_GROUP, summary(40L)));
+
+        ConsumedRetentionManager consumedRetentionManager = newManager(persister, partition);
+        consumedRetentionManager.maybeAdvanceLogStartOffsets();
+        verify(partition).advanceLogStartOffsetForConsumedRetention(90L);
+
+        reconfigure(partition, consumedRetentionConfig(5L, OTHER_GROUP));
+        consumedRetentionManager.maybeAdvanceLogStartOffsets();
+
+        verify(partition).advanceLogStartOffsetForConsumedRetention(35L);
     }
 
     /**
@@ -236,15 +335,14 @@ public class ConsumedRetentionManagerTest {
             "no requested floor may exceed the consumed position minus the lag, but got " + requestedFloors);
     }
 
-    private ConsumedRetentionManager newManager(Persister persister, Partition... partitions) {
-        ReplicaManager replicaManager = mock(ReplicaManager.class);
-        when(replicaManager.leaderPartitionsIterator())
-            .thenAnswer(invocation -> CollectionConverters.asScala(List.of(partitions).iterator()));
-        manager = new ConsumedRetentionManager(replicaManager, persister, mock(Scheduler.class), 30_000L);
+    private ConsumedRetentionManager newManager(Persister persister, Partition... partitionsBecomeLeader) {
+        manager = new ConsumedRetentionManager(tp -> Optional.ofNullable(hostedPartitions.get(tp)), persister,
+            mock(Scheduler.class), 30_000L);
+        manager.onLeadershipChange(Set.of(partitionsBecomeLeader), Set.of());
         return manager;
     }
 
-    private static Partition partition(LogConfig logConfig) {
+    private Partition partition(LogConfig logConfig) {
         UnifiedLog log = mock(UnifiedLog.class);
         when(log.config()).thenReturn(logConfig);
 
@@ -252,7 +350,13 @@ public class ConsumedRetentionManagerTest {
         when(partition.topicPartition()).thenReturn(TOPIC_PARTITION);
         when(partition.topicId()).thenReturn(OptionConverters.toScala(Optional.of(TOPIC_ID)));
         when(partition.leaderLogIfLocal()).thenReturn(OptionConverters.toScala(Optional.of(log)));
+        hostedPartitions.put(TOPIC_PARTITION, partition);
         return partition;
+    }
+
+    private static void reconfigure(Partition partition, LogConfig logConfig) {
+        UnifiedLog log = OptionConverters.toJava(partition.leaderLogIfLocal()).orElseThrow();
+        when(log.config()).thenReturn(logConfig);
     }
 
     private static LogConfig consumedRetentionConfig(long lagMessages, String... groups) {

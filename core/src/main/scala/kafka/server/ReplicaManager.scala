@@ -219,6 +219,13 @@ class ReplicaManager(val config: KafkaConfig,
 
   @volatile private var isInControlledShutdown = false
 
+  // Wired in after construction because the persister it depends on is created after this ReplicaManager.
+  @volatile private var _consumedRetentionManager: Option[ConsumedRetentionManager] = None
+
+  def consumedRetentionManager: Option[ConsumedRetentionManager] = _consumedRetentionManager
+
+  def setConsumedRetentionManager(manager: ConsumedRetentionManager): Unit = _consumedRetentionManager = Some(manager)
+
   this.logIdent = s"[ReplicaManager broker=$localBrokerId] "
   protected val stateChangeLogger = new StateChangeLogger(localBrokerId)
 
@@ -386,6 +393,7 @@ class ReplicaManager(val config: KafkaConfig,
     val partitions = partitionsToStop.map(_.topicPartition)
     replicaFetcherManager.removeFetcherForPartitions(partitions)
     replicaAlterLogDirsManager.removeFetcherForPartitions(partitions)
+    consumedRetentionManager.foreach(_.stopPartitions(partitions.asJava))
 
     // Second remove deleted partitions from the partition map. Fetchers rely on the
     // ReplicaManager to get Partition's information so they must be stopped first.
@@ -2117,7 +2125,7 @@ class ReplicaManager(val config: KafkaConfig,
 
   // An iterator over all partitions led by this broker. Weakly consistent in the same way as onlinePartitionsIterator:
   // a partition whose leadership changes after the iterator has been constructed could still be returned.
-  def leaderPartitionsIterator: Iterator[Partition] =
+  private def leaderPartitionsIterator: Iterator[Partition] =
     onlinePartitionsIterator.filter(_.leaderLogIfLocal.isDefined)
 
   def getLogEndOffset(topicPartition: TopicPartition): Option[Long] =
@@ -2417,6 +2425,7 @@ class ReplicaManager(val config: KafkaConfig,
         replicaAlterLogDirsManager.shutdownIdleFetcherThreads()
 
         remoteLogManager.foreach(rlm => rlm.onLeadershipChange((leaderChangedPartitions.toSet: Set[TopicPartitionLog]).asJava, (followerChangedPartitions.toSet: Set[TopicPartitionLog]).asJava, localChanges.topicIds()))
+        consumedRetentionManager.foreach(crm => crm.onLeadershipChange(leaderChangedPartitions.toSet.asJava, followerChangedPartitions.toSet.asJava))
       }
 
       if (metadataVersion.isDirectoryAssignmentSupported) {

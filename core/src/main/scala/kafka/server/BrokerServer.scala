@@ -494,11 +494,12 @@ class BrokerServer(
 
       /* create the component that advances logStartOffset past records the configured groups have consumed */
       consumedRetentionManager = new ConsumedRetentionManager(
-        replicaManager,
+        (tp: TopicPartition) => replicaManager.onlinePartition(tp).toJava,
         persister,
         kafkaScheduler,
         config.logRetentionConsumedCheckIntervalMs
       )
+      replicaManager.setConsumedRetentionManager(consumedRetentionManager)
       consumedRetentionManager.startup()
 
       dataPlaneRequestProcessor = new KafkaApis(
